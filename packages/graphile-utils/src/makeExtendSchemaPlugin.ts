@@ -1,46 +1,30 @@
-import { SchemaBuilder, Build, Context, Plugin, Options } from "graphile-build";
-import { QueryBuilder, PgClass } from "graphile-build-pg";
 import {
-  // ONLY import types here, not values
-  // Misc:
-  GraphQLIsTypeOfFn,
-
-  // Resolvers:
-  GraphQLFieldResolver,
-  GraphQLTypeResolver,
-  GraphQLResolveInfo,
-
-  // Union types:
-  GraphQLType,
-  GraphQLNamedType,
-  GraphQLOutputType,
-
-  // Config:
-  GraphQLEnumValueConfigMap,
-  GraphQLFieldConfigMap,
-  GraphQLInputFieldConfigMap,
-
-  // Nodes:
-  DirectiveNode,
   DefinitionNode,
   DocumentNode,
-  EnumValueDefinitionNode,
-  FieldDefinitionNode,
-  InputValueDefinitionNode,
-  NameNode,
-  NamedTypeNode,
-  ObjectTypeExtensionNode,
-  StringValueNode,
-  TypeNode,
-  ValueNode,
-  GraphQLList,
-  GraphQLEnumType,
-  GraphQLDirective,
 } from "graphql";
+
+import {
+  SchemaBuilder,
+  Build,
+  Plugin,
+  Options,
+  ContextGraphQLObjectTypeFieldsField,
+  BuildBase,
+  ScopeGraphQLEnumType,
+  ScopeGraphQLObjectType,
+  GraphileObjectTypeConfig,
+  ContextGraphQLObjectTypeFields,
+  ContextGraphQLInputObjectTypeFields,
+  ScopeGraphQLUnionType,
+  GraphileUnionTypeConfig,
+  ScopeGraphQLObjectTypeFieldsField,
+} from "graphile-build";
+import { QueryBuilder, PgClass, PgEntityKind } from "graphile-build-pg";
 import { GraphileEmbed } from "./gql";
 import { InputObjectTypeExtensionNode } from "graphql/language/ast";
 
 import { GraphileHelpers, makeFieldHelpers } from "./fieldHelpers";
+import { DirectiveMap } from "graphile-build/node8plus/SchemaBuilder";
 
 // TODO:v5: Remove
 const recurseDataGeneratorsWorkaroundFieldByType = new Map();
@@ -53,31 +37,38 @@ export type AugmentedGraphQLFieldResolver<
   parent: TSource,
   args: TArgs,
   context: TContext,
-  info: GraphQLResolveInfo & {
-    graphile: GraphileHelpers<TSource>;
+  info: import("graphql").GraphQLResolveInfo & {
+    graphile: GraphileHelpers;
   },
-  useInfoDotGraphileInstead: GraphileHelpers<TSource>
+  useInfoDotGraphileInstead: GraphileHelpers
 ) => any;
 
 export interface ObjectFieldResolver<TSource = any, TContext = any> {
   resolve?: AugmentedGraphQLFieldResolver<TSource, TContext>;
   subscribe?: AugmentedGraphQLFieldResolver<TSource, TContext>;
-  __resolveType?: GraphQLTypeResolver<TSource, TContext>;
-  __isTypeOf?: GraphQLIsTypeOfFn<TSource, TContext>;
+  __resolveType?: import("graphql").GraphQLTypeResolver<TSource, TContext>;
+  __isTypeOf?: import("graphql").GraphQLIsTypeOfFn<TSource, TContext>;
 }
 
 export interface ObjectResolver<TSource = any, TContext = any> {
-  [key: string]:
+  [fieldName: string]:
     | AugmentedGraphQLFieldResolver<TSource, TContext>
     | ObjectFieldResolver<TSource, TContext>;
 }
 
 export interface EnumResolver {
-  [key: string]: string | number | Array<any> | object | symbol;
+  [valueName: string]: string | number | Array<any> | object | symbol;
 }
 
+export type UnionResolver<TSource = any, TContext = any> = {
+  __resolveType?: import("graphql").GraphQLTypeResolver<TSource, TContext>;
+};
+
 export interface Resolvers<TSource = any, TContext = any> {
-  [key: string]: ObjectResolver<TSource, TContext> | EnumResolver;
+  [typeName: string]:
+    | ObjectResolver<TSource, TContext>
+    | EnumResolver
+    | UnionResolver;
 }
 
 export interface ExtensionDefinition {
@@ -85,18 +76,37 @@ export interface ExtensionDefinition {
   resolvers?: Resolvers;
 }
 
-type ParentConstructors<T> = { new (...args: any[]): T };
-type GraphQLNamedTypeConstructor = ParentConstructors<GraphQLNamedType>;
-
 interface NewTypeDef {
-  type: GraphQLNamedTypeConstructor | typeof GraphQLDirective;
+  type:
+    | typeof import("graphql").GraphQLDirective
+    | typeof import("graphql").GraphQLScalarType
+    | typeof import("graphql").GraphQLObjectType
+    | typeof import("graphql").GraphQLInterfaceType
+    | typeof import("graphql").GraphQLUnionType
+    | typeof import("graphql").GraphQLEnumType
+    | typeof import("graphql").GraphQLInputObjectType;
+
   definition: any;
+}
+
+interface TypeExtensions {
+  GraphQLSchema: {
+    directives: Array<any>;
+    types: Array<any>;
+  };
+  GraphQLInputObjectType: { [name: string]: InputObjectTypeExtensionNode[] };
+  GraphQLObjectType: {
+    [name: string]: import("graphql").ObjectTypeExtensionNode[];
+  };
 }
 
 export default function makeExtendSchemaPlugin(
   generator:
     | ExtensionDefinition
-    | ((build: Build, schemaOptions: Options) => ExtensionDefinition),
+    | ((
+        build: Partial<Build> & BuildBase,
+        schemaOptions: Options
+      ) => ExtensionDefinition),
   uniqueId = String(Math.random()).substr(2)
 ): Plugin {
   let graphql: Build["graphql"];
@@ -134,7 +144,7 @@ export default function makeExtendSchemaPlugin(
         [] as DefinitionNode[]
       );
 
-      const typeExtensions = {
+      const typeExtensions: TypeExtensions = {
         GraphQLSchema: {
           directives: [] as Array<any>,
           types: [] as Array<any>,
@@ -186,6 +196,11 @@ export default function makeExtendSchemaPlugin(
           const name = getName(definition.name);
           if (resolvers[name]) {
             const gqlScalarType = resolvers[name];
+            if (!(gqlScalarType instanceof GraphQLScalarType)) {
+              throw new Error(
+                `Type for scalar '${name}' added via makeExtendSchemaPlugin is not a GraphQLScalarType`
+              );
+            }
             if (gqlScalarType.name !== name) {
               throw new Error(
                 `Names for scalar type do not match; schema: '${name}' vs type: '${String(
@@ -193,7 +208,10 @@ export default function makeExtendSchemaPlugin(
                 )}'`
               );
             }
-            addType(gqlScalarType);
+            addType(
+              gqlScalarType,
+              "Scalar defined with makeExtendSchemaPlugin"
+            );
           } else {
             // Create a string type
             newTypes.push({
@@ -212,19 +230,20 @@ export default function makeExtendSchemaPlugin(
           );
         }
       });
-      return build.extend(build, {
-        [`ExtendSchemaPlugin_${uniqueId}_typeExtensions`]: typeExtensions,
-        [`ExtendSchemaPlugin_${uniqueId}_newTypes`]: newTypes,
-        [`ExtendSchemaPlugin_${uniqueId}_resolvers`]: resolvers,
-      });
+      return build.extend(
+        build,
+        {
+          [`ExtendSchemaPlugin_${uniqueId}_typeExtensions`]: typeExtensions,
+          [`ExtendSchemaPlugin_${uniqueId}_newTypes`]: newTypes,
+          [`ExtendSchemaPlugin_${uniqueId}_resolvers`]: resolvers,
+        },
+        "Adding makeExtendSchemaPlugin build extensions"
+      );
     });
 
     builder.hook("init", (_, build, _context) => {
       const {
         newWithHooks,
-        [`ExtendSchemaPlugin_${uniqueId}_typeExtensions`]: typeExtensions, // ONLY use this for GraphQLSchema in this hook
-        [`ExtendSchemaPlugin_${uniqueId}_newTypes`]: newTypes,
-        [`ExtendSchemaPlugin_${uniqueId}_resolvers`]: resolvers,
         graphql: {
           GraphQLEnumType,
           GraphQLObjectType,
@@ -235,6 +254,12 @@ export default function makeExtendSchemaPlugin(
           Kind,
         },
       } = build;
+      const typeExtensions: TypeExtensions =
+        build[`ExtendSchemaPlugin_${uniqueId}_typeExtensions`]; // ONLY use this for GraphQLSchema in this hook
+      const newTypes: NewTypeDef[] =
+        build[`ExtendSchemaPlugin_${uniqueId}_newTypes`];
+      const resolvers: Resolvers<any, any> =
+        build[`ExtendSchemaPlugin_${uniqueId}_resolvers`];
       newTypes.forEach(({ type, definition }: NewTypeDef) => {
         if (type === GraphQLEnumType) {
           // https://graphql.org/graphql-js/type/#graphqlenumtype
@@ -242,10 +267,10 @@ export default function makeExtendSchemaPlugin(
           const description = getDescription(definition.description);
           const directives = getDirectives(definition.directives);
           const relevantResolver = resolvers[name] || {};
-          const values: GraphQLEnumValueConfigMap = definition.values.reduce(
+          const values: import("graphql").GraphQLEnumValueConfigMap = definition.values.reduce(
             (
-              memo: GraphQLEnumValueConfigMap,
-              value: EnumValueDefinitionNode
+              memo: import("graphql").GraphQLEnumValueConfigMap,
+              value: import("graphql").EnumValueDefinitionNode
             ) => {
               const valueName = getName(value.name);
               const valueDescription = getDescription(value.description);
@@ -278,7 +303,7 @@ export default function makeExtendSchemaPlugin(
             },
             {}
           );
-          const scope = {
+          const scope: ScopeGraphQLEnumType = {
             directives,
             ...(directives.scope || {}),
           };
@@ -289,35 +314,29 @@ export default function makeExtendSchemaPlugin(
           const description = getDescription(definition.description);
           const interfaces = getInterfaces(definition.interfaces, build);
           const directives = getDirectives(definition.directives);
-          const scope = {
+          const scope: ScopeGraphQLObjectType = {
             __origin: `makeExtendSchemaPlugin`,
             directives,
             ...(directives.scope || {}),
           };
-          newWithHooks(
-            type,
-            {
-              name,
-              interfaces,
-              fields: (fieldsContext: {
-                Self: typeof type;
-                fieldWithHooks: any;
-              }) =>
-                getFields(
-                  fieldsContext.Self,
-                  definition.fields,
-                  resolvers,
-                  fieldsContext,
-                  build
-                ),
-              ...(description
-                ? {
-                    description,
-                  }
-                : null),
-            },
-            scope
-          );
+          const spec: GraphileObjectTypeConfig<any, any> = {
+            name,
+            interfaces,
+            fields: (fieldsContext: ContextGraphQLObjectTypeFields) =>
+              getFields(
+                fieldsContext.Self,
+                definition.fields,
+                resolvers,
+                fieldsContext,
+                build
+              ),
+            ...(description
+              ? {
+                  description,
+                }
+              : null),
+          };
+          newWithHooks(type, spec, scope);
         } else if (type === GraphQLInputObjectType) {
           // https://graphql.org/graphql-js/type/#graphqlinputobjecttype
           const name = getName(definition.name);
@@ -332,7 +351,7 @@ export default function makeExtendSchemaPlugin(
             type,
             {
               name,
-              fields: ({ Self }: { Self: typeof type }) =>
+              fields: ({ Self }: ContextGraphQLInputObjectTypeFields) =>
                 getInputFields(Self, definition.fields, build),
               ...(description
                 ? {
@@ -347,31 +366,36 @@ export default function makeExtendSchemaPlugin(
           const name = getName(definition.name);
           const description = getDescription(definition.description);
           const directives = getDirectives(definition.directives);
-          const scope = {
+          const scope: ScopeGraphQLUnionType = {
             __origin: `makeExtendSchemaPlugin`,
             directives,
             ...(directives.scope || {}),
           };
-          const resolveType = resolvers[name] && resolvers[name].__resolveType;
-          newWithHooks(
-            type,
-            {
-              name,
-              types: () => {
-                if (Array.isArray(definition.types)) {
-                  return definition.types.map((typeAST: any) => {
+          const resolver = resolvers[name] as UnionResolver | undefined;
+          const resolveType = resolver && resolver.__resolveType;
+          const spec: GraphileUnionTypeConfig<any, any> = {
+            name,
+            types: (): import("graphql").GraphQLObjectType[] => {
+              if (Array.isArray(definition.types)) {
+                return definition.types.map(
+                  (typeAST: any): import("graphql").GraphQLObjectType => {
                     if (typeAST.kind !== "NamedType") {
                       throw new Error("Only support unions of named types");
                     }
-                    return getType(typeAST, build);
-                  });
-                }
-              },
-              ...(resolveType ? { resolveType } : null),
-              ...(description ? { description } : null),
+                    const type = getType(typeAST, build);
+                    if (!type || !(type instanceof GraphQLObjectType)) {
+                      throw new Error(`Invalid type '${type}' for union`);
+                    }
+                    return type;
+                  }
+                );
+              }
+              return [];
             },
-            scope
-          );
+            ...(resolveType ? { resolveType } : null),
+            ...(description ? { description } : null),
+          };
+          newWithHooks(type, spec, scope);
         } else if (type === GraphQLScalarType) {
           const name = getName(definition.name);
           const description = getDescription(definition.description);
@@ -421,9 +445,8 @@ export default function makeExtendSchemaPlugin(
     });
 
     builder.hook("GraphQLSchema", (schema, build, _context) => {
-      const {
-        [`ExtendSchemaPlugin_${uniqueId}_typeExtensions`]: typeExtensions,
-      } = build;
+      const typeExtensions: TypeExtensions =
+        build[`ExtendSchemaPlugin_${uniqueId}_typeExtensions`];
       return {
         ...schema,
         directives: [
@@ -435,17 +458,19 @@ export default function makeExtendSchemaPlugin(
     });
 
     builder.hook("GraphQLObjectType:fields", (fields, build, context: any) => {
-      const {
-        extend,
-        [`ExtendSchemaPlugin_${uniqueId}_typeExtensions`]: typeExtensions,
-        [`ExtendSchemaPlugin_${uniqueId}_resolvers`]: resolvers,
-      } = build;
+      const { extend } = build;
+
+      const typeExtensions: TypeExtensions =
+        build[`ExtendSchemaPlugin_${uniqueId}_typeExtensions`];
+      const resolvers: Resolvers<any, any> =
+        build[`ExtendSchemaPlugin_${uniqueId}_resolvers`];
+
       const { Self } = context;
       if (typeExtensions.GraphQLObjectType[Self.name]) {
         const newFields = typeExtensions.GraphQLObjectType[Self.name].reduce(
           (
-            memo: GraphQLFieldConfigMap<any, any>,
-            extension: ObjectTypeExtensionNode
+            memo: import("graphql").GraphQLFieldConfigMap<any, any>,
+            extension: import("graphql").ObjectTypeExtensionNode
           ) => {
             const moreFields = getFields(
               Self,
@@ -454,50 +479,65 @@ export default function makeExtendSchemaPlugin(
               context,
               build
             );
-            return extend(memo, moreFields);
+            return extend(
+              memo,
+              moreFields,
+              "Building fields in makeExtendSchemaPlugin"
+            );
           },
           {}
         );
-        return extend(fields, newFields);
+        return extend(
+          fields,
+          newFields,
+          "Adding fields from makeExtendSchemaPlugin"
+        );
       } else {
         return fields;
       }
     });
 
     builder.hook("GraphQLInputObjectType:fields", (fields, build, context) => {
-      const {
-        extend,
-        [`ExtendSchemaPlugin_${uniqueId}_typeExtensions`]: typeExtensions,
-      } = build;
+      const { extend } = build;
+      const typeExtensions: TypeExtensions =
+        build[`ExtendSchemaPlugin_${uniqueId}_typeExtensions`];
       const { Self } = context;
       if (typeExtensions.GraphQLInputObjectType[Self.name]) {
         const newFields = typeExtensions.GraphQLInputObjectType[
           Self.name
         ].reduce(
           (
-            memo: GraphQLInputFieldConfigMap,
+            memo: import("graphql").GraphQLInputFieldConfigMap,
             extension: InputObjectTypeExtensionNode
           ) => {
             const moreFields = getInputFields(Self, extension.fields, build);
-            return extend(memo, moreFields);
+            return extend(
+              memo,
+              moreFields,
+              "Making input fields in makeExtendSchemaPlugin"
+            );
           },
           {}
         );
-        return extend(fields, newFields);
+        return extend(
+          fields,
+          newFields,
+          "Adding input fields in makeExtendSchemaPlugin"
+        );
       } else {
         return fields;
       }
     });
   };
 
-  function getName(name: NameNode) {
+  function getName(name: import("graphql").NameNode) {
     if (name && name.kind === "Name" && name.value) {
       return name.value;
     }
     throw new Error("Could not extract name from AST");
   }
 
-  function getDescription(desc: StringValueNode | void) {
+  function getDescription(desc: import("graphql").StringValueNode | void) {
     if (!desc) {
       return null;
     } else if (desc.kind === "StringValue") {
@@ -509,7 +549,10 @@ export default function makeExtendSchemaPlugin(
     }
   }
 
-  function getType(type: TypeNode, build: Build): GraphQLType {
+  function getType(
+    type: import("graphql").TypeNode,
+    build: Build
+  ): import("graphql").GraphQLType {
     if (type.kind === "NamedType") {
       const Type = build.getTypeByName(getName(type.name));
       if (!Type) {
@@ -530,7 +573,7 @@ export default function makeExtendSchemaPlugin(
   }
 
   function getInterfaces(
-    interfaces: ReadonlyArray<NamedTypeNode>,
+    interfaces: ReadonlyArray<import("graphql").NamedTypeNode>,
     _build: Build
   ) {
     if (interfaces.length) {
@@ -542,8 +585,8 @@ export default function makeExtendSchemaPlugin(
   }
 
   function getValue(
-    value: ValueNode | GraphileEmbed,
-    inType?: GraphQLType | null
+    value: import("graphql").ValueNode | GraphileEmbed,
+    inType?: import("graphql").GraphQLType | null
   ):
     | boolean
     | string
@@ -568,9 +611,9 @@ export default function makeExtendSchemaPlugin(
         );
       }
       const enumValueName = value.value;
-      const enumType: GraphQLEnumType | null = graphql.isEnumType(type)
-        ? type
-        : null;
+      const enumType:
+        | import("graphql").GraphQLEnumType
+        | null = graphql.isEnumType(type) ? type : null;
       if (!enumType) {
         throw new Error(
           `Tried to interpret an EnumValue for non-enum type ${type}`
@@ -584,8 +627,9 @@ export default function makeExtendSchemaPlugin(
       return null;
     } else if (value.kind === "ListValue") {
       // This is used in directives, so we cannot assume the type is known.
-      const childType: GraphQLList<GraphQLType> | null =
-        type && graphql.isListType(type) ? type.ofType : null;
+      const childType:
+        | import("graphql").GraphQLList<import("graphql").GraphQLType>
+        | null = type && graphql.isListType(type) ? type.ofType : null;
       return value.values.map(value => getValue(value, childType));
     } else if (value.kind === "GraphileEmbed") {
       // RAW!
@@ -597,14 +641,8 @@ export default function makeExtendSchemaPlugin(
     }
   }
 
-  interface DirectiveMap {
-    [directiveName: string]: {
-      [directiveArgument: string]: any;
-    };
-  }
-
   function getDirectives(
-    directives: ReadonlyArray<DirectiveNode> | void
+    directives: ReadonlyArray<import("graphql").DirectiveNode> | void
   ): DirectiveMap {
     return (directives || []).reduce((directivesList, directive) => {
       if (directive.kind === "Directive") {
@@ -645,38 +683,44 @@ export default function makeExtendSchemaPlugin(
   }
 
   function getArguments(
-    args: ReadonlyArray<InputValueDefinitionNode> | void,
+    args: ReadonlyArray<import("graphql").InputValueDefinitionNode> | void,
     build: Build
-  ) {
+  ): import("graphql").GraphQLFieldConfigArgumentMap {
     if (args && args.length) {
-      return args.reduce((memo, arg) => {
-        if (arg.kind === "InputValueDefinition") {
-          const name = getName(arg.name);
-          const type = getType(arg.type, build);
-          const description = getDescription(arg.description);
-          let defaultValue;
-          if (arg.defaultValue) {
-            defaultValue = getValue(arg.defaultValue, type);
+      return args.reduce(
+        (memo, arg) => {
+          if (arg.kind === "InputValueDefinition") {
+            const name = getName(arg.name);
+            const type = getType(arg.type, build);
+            const description = getDescription(arg.description);
+            let defaultValue;
+            if (arg.defaultValue) {
+              defaultValue = getValue(arg.defaultValue, type);
+            }
+            if (!build.graphql.isInputType(type)) {
+              throw new Error(`Expected input type, but found '${type}'`);
+            }
+            memo[name] = {
+              type,
+              ...(defaultValue != null ? { defaultValue } : null),
+              ...(description ? { description } : null),
+            };
+          } else {
+            throw new Error(
+              `Unexpected '${arg.kind}', we were expecting an 'InputValueDefinition'`
+            );
           }
-          memo[name] = {
-            type,
-            ...(defaultValue != null ? { defaultValue } : null),
-            ...(description ? { description } : null),
-          };
-        } else {
-          throw new Error(
-            `Unexpected '${arg.kind}', we were expecting an 'InputValueDefinition'`
-          );
-        }
-        return memo;
-      }, {});
+          return memo;
+        },
+        {} as import("graphql").GraphQLFieldConfigArgumentMap
+      );
     }
     return {};
   }
 
   function getFields<TSource>(
     SelfGeneric: TSource,
-    fields: ReadonlyArray<FieldDefinitionNode> | void,
+    fields: ReadonlyArray<import("graphql").FieldDefinitionNode> | void,
     resolvers: Resolvers,
     {
       fieldWithHooks,
@@ -689,15 +733,15 @@ export default function makeExtendSchemaPlugin(
     if (!build.graphql.isNamedType(SelfGeneric)) {
       throw new Error("getFields only supports named types");
     }
-    const Self: GraphQLNamedType = SelfGeneric as any;
+    const Self: import("graphql").GraphQLNamedType = SelfGeneric as any;
     const {
       pgSql: sql,
       graphql: { isScalarType, getNamedType },
     } = build;
     function augmentResolver(
       resolver: AugmentedGraphQLFieldResolver<TSource, any>,
-      fieldContext: Context<TSource>,
-      type: GraphQLOutputType
+      fieldContext: ContextGraphQLObjectTypeFieldsField,
+      type: import("graphql").GraphQLOutputType
     ) {
       let got = false;
       let val: any;
@@ -709,13 +753,11 @@ export default function makeExtendSchemaPlugin(
         }
         return val;
       };
-      const newResolver: GraphQLFieldResolver<TSource, any> = async (
-        parent,
-        args,
-        context,
-        resolveInfo
-      ) => {
-        const graphileHelpers: GraphileHelpers<TSource> = makeFieldHelpers(
+      const newResolver: import("graphql").GraphQLFieldResolver<
+        TSource,
+        any
+      > = async (parent, args, context, resolveInfo) => {
+        const graphileHelpers: GraphileHelpers = makeFieldHelpers(
           build,
           fieldContext,
           context,
@@ -755,9 +797,11 @@ export default function makeExtendSchemaPlugin(
           const type = getType(field.type, build);
           const nullableType = build.graphql.getNullableType(type);
           const namedType = build.graphql.getNamedType(type);
-          const typeScope = scopeByType.get(namedType) || {};
+          const typeScope = (scopeByType.get(namedType) || {}) as Partial<
+            ScopeGraphQLObjectType
+          >;
           const directives = getDirectives(field.directives);
-          const scope: any = {
+          const scope: Omit<ScopeGraphQLObjectTypeFieldsField, "fieldName"> = {
             ...(typeScope.pgIntrospection &&
             typeScope.pgIntrospection.kind === "class"
               ? {
@@ -860,13 +904,24 @@ export default function makeExtendSchemaPlugin(
               directives.pgField = directives.recurseDataGenerators;
             }
           }
-          const fieldSpecGenerator = (fieldContext: Context<TSource>) => {
+          const fieldSpecGenerator = (
+            fieldContext: ContextGraphQLObjectTypeFieldsField
+          ): {
+            type: import("graphql").GraphQLOutputType;
+            args?: {};
+            deprecationReason?: string;
+            descroption?: string;
+          } => {
             const { pgIntrospection } = fieldContext.scope;
             // @requires directive: pulls down necessary columns from table.
             //
             //   e.g. `@requires(columns: ["id", "name"])`
             //
-            if (directives.requires && pgIntrospection.kind === "class") {
+            if (
+              directives.requires &&
+              pgIntrospection &&
+              pgIntrospection.kind === PgEntityKind.CLASS
+            ) {
               const table: PgClass = pgIntrospection;
               if (Array.isArray(directives.requires.columns)) {
                 const attrs = table.attributes.filter(
@@ -897,7 +952,8 @@ export default function makeExtendSchemaPlugin(
                               attr.name
                             )})`, // The brackets are necessary to stop the parser getting confused, ref: https://www.postgresql.org/docs/9.6/static/rowtypes.html#ROWTYPES-ACCESSING
                             attr.type,
-                            attr.typeModifier
+                            attr.typeModifier,
+                            queryBuilder
                           ),
                           columnFieldName
                         );
@@ -927,7 +983,7 @@ export default function makeExtendSchemaPlugin(
                         queryBuilder.select(() => {
                           const resolveData = fieldContext.getDataFromParsedResolveInfoFragment(
                             parsedResolveInfoFragment,
-                            namedType
+                            namedType as import("graphql").GraphQLOutputType
                           );
                           const tableAlias = sql.identifier(Symbol());
                           const query = build.pgQueryFromResolveData(
@@ -1002,7 +1058,7 @@ export default function makeExtendSchemaPlugin(
                       newResolversSpec[key] = augmentResolver(
                         rawResolversSpec[key],
                         fieldContext,
-                        type as GraphQLOutputType
+                        type as import("graphql").GraphQLOutputType
                       );
                     }
                     return newResolversSpec;
@@ -1011,7 +1067,7 @@ export default function makeExtendSchemaPlugin(
                 )
               : {};
             return {
-              type,
+              type: type as import("graphql").GraphQLOutputType,
               args,
               ...(deprecationReason
                 ? {
@@ -1027,20 +1083,32 @@ export default function makeExtendSchemaPlugin(
             };
           };
           if (directives.pgField) {
-            return build.extend(memo, {
-              [fieldName]: build.pgField(
-                build,
-                fieldWithHooks,
-                fieldName,
-                fieldSpecGenerator,
-                scope,
-                false
-              ),
-            });
+            return build.extend(
+              memo,
+              {
+                [fieldName]: build.pgField(
+                  build,
+                  fieldWithHooks,
+                  fieldName,
+                  fieldSpecGenerator,
+                  scope,
+                  false
+                ),
+              },
+              `Defining @pgField directive field '${fieldName}'`
+            );
           } else {
-            return build.extend(memo, {
-              [fieldName]: fieldWithHooks(fieldName, fieldSpecGenerator, scope),
-            });
+            return build.extend(
+              memo,
+              {
+                [fieldName]: fieldWithHooks(
+                  fieldName,
+                  fieldSpecGenerator,
+                  scope
+                ),
+              },
+              `Defining a new field '${fieldName}' in makeExtendSchemaPlugin`
+            );
           }
         } else {
           throw new Error(
@@ -1054,7 +1122,7 @@ export default function makeExtendSchemaPlugin(
 
   function getInputFields<TSource>(
     _Self: TSource,
-    fields: ReadonlyArray<InputValueDefinitionNode> | void,
+    fields: ReadonlyArray<import("graphql").InputValueDefinitionNode> | void,
     build: Build
   ) {
     if (fields && fields.length) {
